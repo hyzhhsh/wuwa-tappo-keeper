@@ -93,8 +93,16 @@ CHEST_CLICK_COST = 1000
 # 留空表示不发送通知。
 # 飞书开箱通知卡片的标题。
 WEBHOOK_TITLE = "Wuwa Tappo · 开箱成功"
+# 生命周期卡片标题：启动成功、启动失败、运行期凭据失效。
+STARTUP_TITLE = "Wuwa Tappo · 开始运行"
+STARTUP_FAILED_TITLE = "Wuwa Tappo · 启动失败"
+AUTH_FAILED_TITLE = "Wuwa Tappo · 凭据已失效"
 # 发送飞书 webhook 请求的超时时间（秒）。
 FEISHU_TIMEOUT_SEC = 10
+# 生命周期卡片同步发送的超时时间（秒），避免拖慢启动或退出。
+LIFECYCLE_FEISHU_TIMEOUT_SEC = 5
+# 卡片中错误描述的最大长度，避免超长消息影响排版。
+CARD_TEXT_MAX = 300
 # 奖励类型到 CDN 目录的映射；接口只返回文件名，不返回完整 URL。
 REWARD_IMAGE_DIRS = {
     "character_skin": "character",  # 角色皮肤
@@ -309,6 +317,22 @@ def load_credentials() -> Optional[dict]:
     if not isinstance(cred, dict) or not cred.get("token"):
         return None
     return cred
+
+
+def load_webhook_url() -> str:
+    """只读取 credentials.json 中的 feishu_webhook，供启动失败时兜底通知。"""
+    if not CREDENTIALS_FILE.exists():
+        return ""
+
+    try:
+        data = json.loads(CREDENTIALS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("无法读取 %s：%s", CREDENTIALS_FILE.name, exc)
+        return ""
+
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("feishu_webhook") or "").strip()
 
 
 # ============================== 异常与 HTTP 客户端 ==============================
@@ -1255,6 +1279,108 @@ def build_test_card(*, now: Optional[datetime] = None) -> dict:
     }
 
 
+def chest_state_text(chest: dict) -> str:
+    """把宝箱状态转成卡片中的中文描述。"""
+    if to_int(chest.get("readyAt")) <= 0:
+        return "未知"
+    if chest.get("ready"):
+        return "已就绪"
+    return format_countdown(to_int(chest.get("readyInMs")))
+
+
+def build_startup_card(
+    nickname: str,
+    cuid: str,
+    available: int,
+    chests: list[dict],
+    *,
+    open_enabled: bool,
+    time_synced: bool,
+) -> dict:
+    """构造启动成功的飞书卡片，展示可用点击和左右宝箱状态。"""
+    states = {str(chest.get("place")): chest for chest in chests}
+    columns = [
+        stat_column("可用点击", f"{to_int(available):,}"),
+        stat_column("自动开箱", "已启用" if open_enabled else "已关闭"),
+    ]
+    for place in CHEST_PLACES:
+        chest = states.get(place)
+        if chest is None or not time_synced:
+            state = "未知"
+        else:
+            state = chest_state_text(chest)
+        columns.append(stat_column(place_label(place), state))
+
+    elements: list[dict] = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"**{nickname or '未知账号'}**\n"
+                f"<font color='grey'>cuid {cuid or '-'}</font>"
+            ),
+        },
+        {"tag": "hr"},
+        {"tag": "column_set", "columns": columns},
+    ]
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "green",
+            "title": {"tag": "plain_text", "content": STARTUP_TITLE},
+        },
+        "body": {"elements": elements},
+    }
+
+
+def card_text(value: Any) -> str:
+    """把错误描述压缩成单行并截断，避免超长内容破坏卡片排版。"""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "未知错误"
+    if len(text) > CARD_TEXT_MAX:
+        return text[: CARD_TEXT_MAX - 1] + "…"
+    return text
+
+
+def build_alert_card(
+    title: str,
+    reason: Any,
+    *,
+    template: str = "red",
+    account: str = "",
+    now: Optional[datetime] = None,
+) -> dict:
+    """构造启动失败或凭据失效的提醒卡片。"""
+    if now is None:
+        now = datetime.now()
+
+    elements: list[dict] = [
+        {"tag": "markdown", "content": f"**{card_text(reason)}**"},
+    ]
+    if account:
+        elements.append({
+            "tag": "markdown",
+            "content": f"<font color='grey'>账号</font> {account}",
+        })
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "markdown",
+        "content": f"<font color='grey'>时间</font> {now:%Y-%m-%d %H:%M:%S}",
+    })
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "body": {"elements": elements},
+    }
+
+
 def mask_webhook(url: str) -> str:
     """日志中只暴露 webhook token 的末四位。"""
     text = str(url or "").rstrip("/")
@@ -1265,7 +1391,11 @@ def mask_webhook(url: str) -> str:
     return "***"
 
 
-def send_feishu_card(webhook_url: str, card: dict) -> bool:
+def send_feishu_card(
+    webhook_url: str,
+    card: dict,
+    timeout: float = FEISHU_TIMEOUT_SEC,
+) -> bool:
     """发送飞书卡片；失败只记录日志，不向上抛异常。"""
     if not webhook_url:
         return False
@@ -1274,7 +1404,7 @@ def send_feishu_card(webhook_url: str, card: dict) -> bool:
         response = requests.post(
             webhook_url,
             json={"msg_type": "interactive", "card": card},
-            timeout=FEISHU_TIMEOUT_SEC,
+            timeout=timeout,
         )
     except requests.RequestException as exc:
         text = str(webhook_url).rstrip("/")
@@ -1310,6 +1440,24 @@ def send_feishu_card(webhook_url: str, card: dict) -> bool:
 
     log.info("飞书卡片已发送（HTTP %s）", response.status_code)
     return True
+
+
+def notify_startup_failure(exc: BaseException) -> None:
+    """启动失败时尽力发送提醒卡片；webhook 缺失或发送失败都只记录日志。"""
+    webhook_url = load_webhook_url()
+    if not webhook_url:
+        return
+
+    reason = str(exc) or type(exc).__name__
+    card = build_alert_card(STARTUP_FAILED_TITLE, reason)
+    try:
+        send_feishu_card(
+            webhook_url,
+            card,
+            timeout=LIFECYCLE_FEISHU_TIMEOUT_SEC,
+        )
+    except Exception as send_exc:
+        log.warning("启动失败提醒发送异常：%s", send_exc)
 
 
 # ============================== Socket.IO 客户端 ==============================
@@ -2133,12 +2281,56 @@ class Bot:
 
         self.next_renew = time.time() + RENEW_CHECK_SEC
 
+    def _send_lifecycle_card(self, card: dict) -> bool:
+        """同步发送生命周期卡片，确保进程退出前完成。"""
+        if self.dry_run or not self.webhook_url:
+            return False
+        try:
+            return send_feishu_card(
+                self.webhook_url,
+                card,
+                timeout=LIFECYCLE_FEISHU_TIMEOUT_SEC,
+            )
+        except Exception as exc:
+            log.warning("飞书提醒发送异常：%s", exc)
+            return False
+
+    def notify_startup(self) -> None:
+        """启动成功后发送包含账号与左右箱状态的卡片。"""
+        if self.dry_run or not self.webhook_url:
+            return
+
+        total = to_int(self.me.get("total_click_count"))
+        consumed = to_int(self.me.get("total_click_consume"))
+        card = build_startup_card(
+            str(self.me.get("nickname") or self.cred.get("nickname") or ""),
+            str(self.me.get("cuid") or self.cred.get("cuid") or ""),
+            max(0, total - consumed),
+            self.chests,
+            open_enabled=not self.no_open,
+            time_synced=self.time_synced,
+        )
+        self._send_lifecycle_card(card)
+
     def handle_auth_error(self, exc: ApiError) -> None:
         """处理认证失效：关闭 socket、重新登录并重置运行状态。"""
         log.error("认证已失效（%s）：%s", exc.code, exc.message)
         if self.sock is not None:
             self.sock.close()
             self.sock = None
+
+        account = str(
+            self.me.get("nickname")
+            or self.cred.get("nickname")
+            or self.me.get("cuid")
+            or self.cred.get("cuid")
+            or ""
+        )
+        self._send_lifecycle_card(build_alert_card(
+            AUTH_FAILED_TITLE,
+            f"认证失败（{exc.code}）：{exc.message or '登录已过期'}",
+            account=account,
+        ))
 
         if not sys.stdin.isatty():
             raise SystemExit(
@@ -2238,6 +2430,8 @@ class Bot:
                 "飞书通知：已关闭（%s 中没有 feishu_webhook；可运行 --login 设置）",
                 CREDENTIALS_FILE.name,
             )
+
+        self.notify_startup()
 
         if self.time_synced:
             self.maybe_open_chests(self.me)
@@ -2363,14 +2557,20 @@ def main() -> int:
             return 0
         return 1
 
-    api = ApiClient(API_HOST)
-    cred, me = bootstrap(api, args)
+    notifications_enabled = not args.login and not args.dry_run
+    try:
+        api = ApiClient(API_HOST)
+        cred, me = bootstrap(api, args)
 
-    if args.login:
-        log.info("登录完成，凭据已保存，正在退出。")
-        return 0
+        if args.login:
+            log.info("登录完成，凭据已保存，正在退出。")
+            return 0
 
-    bot = Bot(api, cred, me, args)
+        bot = Bot(api, cred, me, args)
+    except (SystemExit, ApiError, NetworkError) as exc:
+        if notifications_enabled:
+            notify_startup_failure(exc)
+        raise
 
     def handle_signal(signum: int, _frame: Any) -> None:
         log.info("收到信号 %s，正在停止......", signum)
