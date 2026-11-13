@@ -3,12 +3,15 @@
 
 登录后持续上报点击，按服务器时间自动开宝箱，并在每次开箱成功后发送飞书卡片。
 登录支持两种方式：游戏 UID + 游戏内站内信验证码，或库洛通行证手机号 + 短信验证码。
-凭据和飞书 webhook URL 保存在脚本同目录的 credentials.json 中。
+凭据、飞书 webhook URL 与可选签名密钥保存在脚本同目录的 credentials.json 中。
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -99,6 +102,8 @@ STARTUP_FAILED_TITLE = "Wuwa Tappo · 启动失败"
 AUTH_FAILED_TITLE = "Wuwa Tappo · 凭据已失效"
 # 发送飞书 webhook 请求的超时时间（秒）。
 FEISHU_TIMEOUT_SEC = 10
+# 飞书机器人签名校验失败的业务码，用于日志补充排查提示。
+FEISHU_SIGN_ERROR_CODE = 19021
 # 生命周期卡片同步发送的超时时间（秒），避免拖慢启动或退出。
 LIFECYCLE_FEISHU_TIMEOUT_SEC = 5
 # 卡片中错误描述的最大长度，避免超长消息影响排版。
@@ -319,20 +324,23 @@ def load_credentials() -> Optional[dict]:
     return cred
 
 
-def load_webhook_url() -> str:
-    """只读取 credentials.json 中的 feishu_webhook，供启动失败时兜底通知。"""
+def load_feishu_config() -> tuple[str, str]:
+    """只读取 credentials.json 中的飞书 webhook 与签名密钥，供启动失败时兜底通知。"""
     if not CREDENTIALS_FILE.exists():
-        return ""
+        return "", ""
 
     try:
         data = json.loads(CREDENTIALS_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("无法读取 %s：%s", CREDENTIALS_FILE.name, exc)
-        return ""
+        return "", ""
 
     if not isinstance(data, dict):
-        return ""
-    return str(data.get("feishu_webhook") or "").strip()
+        return "", ""
+    return (
+        str(data.get("feishu_webhook") or "").strip(),
+        str(data.get("feishu_secret") or "").strip(),
+    )
 
 
 # ============================== 异常与 HTTP 客户端 ==============================
@@ -614,12 +622,24 @@ def prompt_uid(preferred: Optional[str] = None) -> str:
     return uid
 
 
+def prompt_feishu_config() -> tuple[str, str]:
+    """交互收集 webhook 与可选签名密钥；未填 webhook 时视为关闭通知。"""
+    webhook = input("飞书机器人 webhook URL（直接回车表示关闭通知）：").strip()
+    secret = ""
+    if webhook:
+        secret = input(
+            "飞书机器人签名密钥（直接回车表示未开启签名校验）："
+        ).strip()
+    return webhook, secret
+
+
 def uid_login_flow(
     api: ApiClient,
     preferred_uid: Optional[str] = None,
     *,
     ask_webhook: bool = False,
     existing_feishu_webhook: str = "",
+    existing_feishu_secret: str = "",
     existing_device_id: str = "",
 ) -> tuple[dict, dict]:
     """UID + 游戏内站内信验证码登录。
@@ -706,6 +726,7 @@ def uid_login_flow(
         "nickname": data.get("nickname"),
         "saved_at": int(time.time() * 1000),
         "feishu_webhook": existing_feishu_webhook,
+        "feishu_secret": existing_feishu_secret,
         "login_method": "uid",
     }
     if existing_device_id:
@@ -719,9 +740,7 @@ def uid_login_flow(
     cred["nickname"] = me.get("nickname") or cred["nickname"]
 
     if ask_webhook:
-        cred["feishu_webhook"] = input(
-            "飞书机器人 webhook URL（直接回车表示关闭通知）："
-        ).strip()
+        cred["feishu_webhook"], cred["feishu_secret"] = prompt_feishu_config()
 
     save_credentials(cred)
     log.info(
@@ -731,7 +750,10 @@ def uid_login_flow(
         CREDENTIALS_FILE.name,
     )
     if cred["feishu_webhook"]:
-        log.info("飞书通知：已启用")
+        if cred["feishu_secret"]:
+            log.info("飞书通知：已启用（签名校验）")
+        else:
+            log.info("飞书通知：已启用")
     else:
         log.info("飞书通知：已关闭（未配置 webhook）")
     return cred, me
@@ -765,6 +787,7 @@ def phone_login_flow(
     *,
     ask_webhook: bool = False,
     existing_feishu_webhook: str = "",
+    existing_feishu_secret: str = "",
     existing_device_id: str = "",
 ) -> tuple[dict, dict]:
     """库洛通行证手机号 + 短信验证码登录。
@@ -948,6 +971,7 @@ def phone_login_flow(
         "nickname": role.get("playerName") or username,
         "saved_at": int(time.time() * 1000),
         "feishu_webhook": existing_feishu_webhook,
+        "feishu_secret": existing_feishu_secret,
         "login_method": "phone",
         "kuro_device_id": device_id,
     }
@@ -960,9 +984,7 @@ def phone_login_flow(
     cred["nickname"] = me.get("nickname") or cred["nickname"]
 
     if ask_webhook:
-        cred["feishu_webhook"] = input(
-            "飞书机器人 webhook URL（直接回车表示关闭通知）："
-        ).strip()
+        cred["feishu_webhook"], cred["feishu_secret"] = prompt_feishu_config()
 
     save_credentials(cred)
     log.info(
@@ -972,7 +994,10 @@ def phone_login_flow(
         CREDENTIALS_FILE.name,
     )
     if cred["feishu_webhook"]:
-        log.info("飞书通知：已启用")
+        if cred["feishu_secret"]:
+            log.info("飞书通知：已启用（签名校验）")
+        else:
+            log.info("飞书通知：已启用")
     else:
         log.info("飞书通知：已关闭（未配置 webhook）")
     return cred, me
@@ -984,6 +1009,7 @@ def login_flow(
     *,
     ask_webhook: bool = False,
     existing_feishu_webhook: str = "",
+    existing_feishu_secret: str = "",
     method: Optional[str] = None,
     existing_device_id: str = "",
 ) -> tuple[dict, dict]:
@@ -1000,6 +1026,7 @@ def login_flow(
             api,
             ask_webhook=ask_webhook,
             existing_feishu_webhook=existing_feishu_webhook,
+            existing_feishu_secret=existing_feishu_secret,
             existing_device_id=existing_device_id,
         )
     if method != "uid":
@@ -1009,6 +1036,7 @@ def login_flow(
         preferred_uid,
         ask_webhook=ask_webhook,
         existing_feishu_webhook=existing_feishu_webhook,
+        existing_feishu_secret=existing_feishu_secret,
         existing_device_id=existing_device_id,
     )
 
@@ -1079,6 +1107,7 @@ def bootstrap(api: ApiClient, args: argparse.Namespace) -> tuple[dict, dict]:
         preferred_uid=existing.get("uid"),
         ask_webhook=True,
         existing_feishu_webhook=str(existing.get("feishu_webhook") or ""),
+        existing_feishu_secret=str(existing.get("feishu_secret") or ""),
         method=method,
         existing_device_id=str(existing.get("kuro_device_id") or ""),
     )
@@ -1391,9 +1420,28 @@ def mask_webhook(url: str) -> str:
     return "***"
 
 
+def feishu_sign(timestamp: int, secret: str) -> str:
+    """按飞书规则计算签名：HmacSHA256(timestamp + 换行 + secret, 空串) 后 Base64。"""
+    key = f"{timestamp}\n{secret}".encode("utf-8")
+    digest = hmac.new(key, b"", digestmod=hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def feishu_payload(card: dict, secret: str = "") -> dict:
+    """组装飞书卡片请求体；配置了密钥时附加实时时间戳与签名。"""
+    payload = {"msg_type": "interactive", "card": card}
+    secret = str(secret or "").strip()
+    if secret:
+        timestamp = int(time.time())
+        payload["timestamp"] = str(timestamp)
+        payload["sign"] = feishu_sign(timestamp, secret)
+    return payload
+
+
 def send_feishu_card(
     webhook_url: str,
     card: dict,
+    secret: str = "",
     timeout: float = FEISHU_TIMEOUT_SEC,
 ) -> bool:
     """发送飞书卡片；失败只记录日志，不向上抛异常。"""
@@ -1403,7 +1451,7 @@ def send_feishu_card(
     try:
         response = requests.post(
             webhook_url,
-            json={"msg_type": "interactive", "card": card},
+            json=feishu_payload(card, secret),
             timeout=timeout,
         )
     except requests.RequestException as exc:
@@ -1436,6 +1484,8 @@ def send_feishu_card(
             code,
             body.get("msg") or body.get("StatusMessage") or "",
         )
+        if to_int(code, -1) == FEISHU_SIGN_ERROR_CODE:
+            log.warning("签名校验失败，请检查 feishu_secret 与运行主机的系统时间")
         return False
 
     log.info("飞书卡片已发送（HTTP %s）", response.status_code)
@@ -1444,7 +1494,7 @@ def send_feishu_card(
 
 def notify_startup_failure(exc: BaseException) -> None:
     """启动失败时尽力发送提醒卡片；webhook 缺失或发送失败都只记录日志。"""
-    webhook_url = load_webhook_url()
+    webhook_url, secret = load_feishu_config()
     if not webhook_url:
         return
 
@@ -1454,6 +1504,7 @@ def notify_startup_failure(exc: BaseException) -> None:
         send_feishu_card(
             webhook_url,
             card,
+            secret,
             timeout=LIFECYCLE_FEISHU_TIMEOUT_SEC,
         )
     except Exception as send_exc:
@@ -1794,6 +1845,7 @@ class Bot:
         self.dry_run = bool(args.dry_run)
         self.no_open = bool(args.no_open)
         self.webhook_url = str(cred.get("feishu_webhook") or "").strip()
+        self.webhook_secret = str(cred.get("feishu_secret") or "").strip()
         self.stop = False
 
         self.sock: Optional[SocketIOClient] = None
@@ -2097,7 +2149,7 @@ class Bot:
                     try:
                         threading.Thread(
                             target=send_feishu_card,
-                            args=(self.webhook_url, card),
+                            args=(self.webhook_url, card, self.webhook_secret),
                             name="wuwa-feishu",
                             daemon=True,
                         ).start()
@@ -2289,6 +2341,7 @@ class Bot:
             return send_feishu_card(
                 self.webhook_url,
                 card,
+                self.webhook_secret,
                 timeout=LIFECYCLE_FEISHU_TIMEOUT_SEC,
             )
         except Exception as exc:
@@ -2342,10 +2395,12 @@ class Bot:
             self.api,
             preferred_uid=self.cred.get("uid"),
             existing_feishu_webhook=self.webhook_url,
+            existing_feishu_secret=self.webhook_secret,
             method=str(self.cred.get("login_method") or "") or None,
             existing_device_id=str(self.cred.get("kuro_device_id") or ""),
         )
         self.webhook_url = str(self.cred.get("feishu_webhook") or "").strip()
+        self.webhook_secret = str(self.cred.get("feishu_secret") or "").strip()
         if me:
             self.me = me
         else:
@@ -2424,7 +2479,10 @@ class Bot:
         self.log_account()
 
         if self.webhook_url:
-            log.info("飞书通知：已启用")
+            if self.webhook_secret:
+                log.info("飞书通知：已启用（签名校验）")
+            else:
+                log.info("飞书通知：已启用")
         else:
             log.warning(
                 "飞书通知：已关闭（%s 中没有 feishu_webhook；可运行 --login 设置）",
@@ -2543,8 +2601,10 @@ def main() -> int:
     if args.test_webhook:
         cred = load_credentials()
         webhook_url = ""
+        secret = ""
         if cred is not None:
             webhook_url = str(cred.get("feishu_webhook") or "").strip()
+            secret = str(cred.get("feishu_secret") or "").strip()
 
         if not webhook_url:
             log.error(
@@ -2553,7 +2613,7 @@ def main() -> int:
             )
             return 1
 
-        if send_feishu_card(webhook_url, build_test_card()):
+        if send_feishu_card(webhook_url, build_test_card(), secret):
             return 0
         return 1
 
