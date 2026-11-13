@@ -843,7 +843,7 @@ def phone_login_flow(
         query = api.request(
             "POST",
             "api/auth/player/query",
-            body={"cuid": cuid, "is_domestic": 1},
+            body={"cuid": cuid, "is_domestic": 1, "accessToken": access_token, "cname": username},
             token="",
         )
     except ApiError as exc:
