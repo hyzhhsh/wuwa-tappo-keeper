@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """WuwaTappoKeeper：无人值守的 Wuwa Tappo 自动上报与开箱工具。
 
-登录后持续上报点击，按服务器时间自动开宝箱，并在每次开箱成功后发送飞书卡片。
+登录后持续上报点击，按服务器时间自动开宝箱，凑齐材料时自动升阶合成收集物，
+并在开箱与合成成功后发送飞书卡片。
 登录支持两种方式：游戏 UID + 游戏内站内信验证码，或库洛通行证手机号 + 短信验证码。
 凭据、飞书 webhook URL 与可选签名密钥保存在脚本同目录的 credentials.json 中。
 """
@@ -92,10 +93,17 @@ OPEN_DELAY_SEC = 3
 # 开启一个宝箱所需的点击数。
 CHEST_CLICK_COST = 1000
 
+# 一次升阶合成消耗的同品类同稀有度收集物数量。
+SYNTHESIS_MATERIAL_COUNT = 10
+# 连续两次升阶合成之间的基准间隔（秒），实际间隔还会额外随机加 0–2 秒。
+SYNTHESIS_DELAY_SEC = 1
+
 # 飞书自定义机器人 webhook 在 --login 时收集并写入 credentials.json；
 # 留空表示不发送通知。
 # 飞书开箱通知卡片的标题。
 WEBHOOK_TITLE = "Wuwa Tappo · 开箱成功"
+# 飞书升阶合成通知卡片的标题。
+SYNTHESIS_TITLE = "Wuwa Tappo · 升阶合成"
 # 生命周期卡片标题：启动成功、启动失败、运行期凭据失效。
 STARTUP_TITLE = "Wuwa Tappo · 开始运行"
 STARTUP_FAILED_TITLE = "Wuwa Tappo · 启动失败"
@@ -164,6 +172,8 @@ KURO_SDK_GEETEST_CODE = 41000
 AUTH_ERROR_CODES = {10003, 90002}
 # 宝箱位置标识，顺序即开箱优先级。
 CHEST_PLACES = ("left", "right")
+# 收集物稀有度，从低到高；最高稀有度没有更高一级，无法参与升阶合成。
+BAG_RARITY_ORDER = ("common", "uncommon", "rare", "epic")
 
 
 # ============================== 日志初始化 ==============================
@@ -633,6 +643,15 @@ def prompt_feishu_config() -> tuple[str, str]:
     return webhook, secret
 
 
+def prompt_auto_synthesis() -> bool:
+    """交互询问是否开启自动升阶合成，默认关闭。"""
+    choice = input(
+        "是否开启自动升阶合成？"
+        f"（开箱后每凑齐 {SYNTHESIS_MATERIAL_COUNT} 个同品类同稀有度收集物自动合成）[y/N]："
+    ).strip().lower()
+    return choice in {"y", "yes", "是", "1"}
+
+
 def uid_login_flow(
     api: ApiClient,
     preferred_uid: Optional[str] = None,
@@ -640,6 +659,7 @@ def uid_login_flow(
     ask_webhook: bool = False,
     existing_feishu_webhook: str = "",
     existing_feishu_secret: str = "",
+    existing_auto_synthesis: bool = False,
     existing_device_id: str = "",
 ) -> tuple[dict, dict]:
     """UID + 游戏内站内信验证码登录。
@@ -727,6 +747,7 @@ def uid_login_flow(
         "saved_at": int(time.time() * 1000),
         "feishu_webhook": existing_feishu_webhook,
         "feishu_secret": existing_feishu_secret,
+        "auto_synthesis": existing_auto_synthesis,
         "login_method": "uid",
     }
     if existing_device_id:
@@ -741,6 +762,7 @@ def uid_login_flow(
 
     if ask_webhook:
         cred["feishu_webhook"], cred["feishu_secret"] = prompt_feishu_config()
+        cred["auto_synthesis"] = prompt_auto_synthesis()
 
     save_credentials(cred)
     log.info(
@@ -756,6 +778,10 @@ def uid_login_flow(
             log.info("飞书通知：已启用")
     else:
         log.info("飞书通知：已关闭（未配置 webhook）")
+    if cred["auto_synthesis"]:
+        log.info("自动升阶合成：已开启")
+    else:
+        log.info("自动升阶合成：未开启")
     return cred, me
 
 
@@ -788,6 +814,7 @@ def phone_login_flow(
     ask_webhook: bool = False,
     existing_feishu_webhook: str = "",
     existing_feishu_secret: str = "",
+    existing_auto_synthesis: bool = False,
     existing_device_id: str = "",
 ) -> tuple[dict, dict]:
     """库洛通行证手机号 + 短信验证码登录。
@@ -972,6 +999,7 @@ def phone_login_flow(
         "saved_at": int(time.time() * 1000),
         "feishu_webhook": existing_feishu_webhook,
         "feishu_secret": existing_feishu_secret,
+        "auto_synthesis": existing_auto_synthesis,
         "login_method": "phone",
         "kuro_device_id": device_id,
     }
@@ -985,6 +1013,7 @@ def phone_login_flow(
 
     if ask_webhook:
         cred["feishu_webhook"], cred["feishu_secret"] = prompt_feishu_config()
+        cred["auto_synthesis"] = prompt_auto_synthesis()
 
     save_credentials(cred)
     log.info(
@@ -1000,6 +1029,10 @@ def phone_login_flow(
             log.info("飞书通知：已启用")
     else:
         log.info("飞书通知：已关闭（未配置 webhook）")
+    if cred["auto_synthesis"]:
+        log.info("自动升阶合成：已开启")
+    else:
+        log.info("自动升阶合成：未开启")
     return cred, me
 
 
@@ -1010,6 +1043,7 @@ def login_flow(
     ask_webhook: bool = False,
     existing_feishu_webhook: str = "",
     existing_feishu_secret: str = "",
+    existing_auto_synthesis: bool = False,
     method: Optional[str] = None,
     existing_device_id: str = "",
 ) -> tuple[dict, dict]:
@@ -1027,6 +1061,7 @@ def login_flow(
             ask_webhook=ask_webhook,
             existing_feishu_webhook=existing_feishu_webhook,
             existing_feishu_secret=existing_feishu_secret,
+            existing_auto_synthesis=existing_auto_synthesis,
             existing_device_id=existing_device_id,
         )
     if method != "uid":
@@ -1037,6 +1072,7 @@ def login_flow(
         ask_webhook=ask_webhook,
         existing_feishu_webhook=existing_feishu_webhook,
         existing_feishu_secret=existing_feishu_secret,
+        existing_auto_synthesis=existing_auto_synthesis,
         existing_device_id=existing_device_id,
     )
 
@@ -1108,6 +1144,7 @@ def bootstrap(api: ApiClient, args: argparse.Namespace) -> tuple[dict, dict]:
         ask_webhook=True,
         existing_feishu_webhook=str(existing.get("feishu_webhook") or ""),
         existing_feishu_secret=str(existing.get("feishu_secret") or ""),
+        existing_auto_synthesis=bool(existing.get("auto_synthesis")),
         method=method,
         existing_device_id=str(existing.get("kuro_device_id") or ""),
     )
@@ -1280,6 +1317,69 @@ def build_open_card(
     }
 
 
+def build_synthesis_card(
+    asset_type: str,
+    data: dict,
+    *,
+    image_url: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict:
+    """构造升阶合成成功的飞书卡片。"""
+    if now is None:
+        now = datetime.now()
+
+    source_type = str(asset_type or "").strip()
+    result_type = str(data.get("asset_type") or source_type).strip()
+    result_type_label = ASSET_TYPE_LABELS.get(result_type, result_type or "未知")
+    rarity_label, tag_color, template = rarity_style(data.get("rarity_type"))
+
+    elements: list[dict] = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"**{result_type_label}**\n"
+                f"<font color='grey'>{display_asset_name(data.get('asset_name'))}</font>"
+            ),
+        },
+        {"tag": "hr"},
+        {
+            "tag": "markdown",
+            "content": (
+                "<font color='grey'>合成时间</font>\n"
+                f"**{now.strftime('%m-%d %H:%M')}**"
+            ),
+        },
+    ]
+
+    if image_url:
+        elements.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "查看产物原图"},
+            "type": "default",
+            "behaviors": [{"type": "open_url", "default_url": image_url}],
+        })
+    else:
+        elements.append({
+            "tag": "markdown",
+            "content": "<font color='grey'>原图暂不可用</font>",
+        })
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": SYNTHESIS_TITLE},
+            "text_tag_list": [{
+                "tag": "text_tag",
+                "text": {"tag": "plain_text", "content": rarity_label},
+                "color": tag_color,
+            }],
+        },
+        "body": {"elements": elements},
+    }
+
+
 def build_test_card(*, now: Optional[datetime] = None) -> dict:
     """构造一张飞书测试卡片，用于验证 webhook。"""
     if now is None:
@@ -1296,7 +1396,7 @@ def build_test_card(*, now: Optional[datetime] = None) -> dict:
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": "飞书自定义机器人已配置成功。\n开箱结果将以卡片消息推送到本群。",
+                    "content": "飞书自定义机器人已配置成功。\n开箱与合成结果将以卡片消息推送到本群。",
                 },
                 {"tag": "hr"},
                 {
@@ -1833,7 +1933,7 @@ class SocketIOClient:
 # ============================== 机器人主循环 ==============================
 
 class Bot:
-    """运行期状态与调度：上报点击、刷新账号、开箱并发送飞书通知。"""
+    """运行期状态与调度：上报点击、刷新账号、开箱、升阶合成并发送飞书通知。"""
 
     def __init__(self, api: ApiClient, cred: dict, me: dict, args: argparse.Namespace):
         self.api = api
@@ -1844,6 +1944,7 @@ class Bot:
             self.me = {}
         self.dry_run = bool(args.dry_run)
         self.no_open = bool(args.no_open)
+        self.auto_synthesis = bool(cred.get("auto_synthesis"))
         self.webhook_url = str(cred.get("feishu_webhook") or "").strip()
         self.webhook_secret = str(cred.get("feishu_secret") or "").strip()
         self.stop = False
@@ -2007,7 +2108,7 @@ class Bot:
         self.chests = self.compute_chests(self.me)
 
     def refresh_me(self) -> None:
-        """刷新 /me，然后检查是否可以开箱。"""
+        """刷新 /me，开箱成功后检查自动升阶合成。"""
         try:
             me = self.api.request("GET", "api/frontend/user/me")
         except ApiError as exc:
@@ -2034,28 +2135,30 @@ class Bot:
             chest_pairs,
         )
 
-        self.maybe_open_chests(me)
+        if self.maybe_open_chests(me):
+            self.maybe_synthesize()
 
-    def maybe_open_chests(self, me: dict) -> None:
-        """检查并开启已就绪的宝箱。
+    def maybe_open_chests(self, me: dict) -> bool:
+        """检查并开启已就绪的宝箱，返回是否有宝箱被成功开启。
 
         左右两个箱子共用一个循环：开箱后立刻刷新 /me 覆盖 current，
         如果另一侧也已就绪，间隔 3 秒后再开一次；刷新失败则结束本次开箱。
         """
         if self.no_open or not self.time_synced:
-            return
+            return False
 
         if not me:
             current = {}
         else:
             current = me
 
+        opened = False
         for attempt in range(len(CHEST_PLACES)):
             total = to_int(current.get("total_click_count"))
             consumed = to_int(current.get("total_click_consume"))
             available = max(0, total - consumed)
             if available < CHEST_CLICK_COST:
-                return
+                return opened
 
             now = self.server_now_ms()
             place = None
@@ -2065,7 +2168,7 @@ class Bot:
                     place = candidate
                     break
             if place is None:
-                return
+                return opened
             label = place_label(place)
 
             if self.dry_run:
@@ -2075,7 +2178,7 @@ class Bot:
                     available,
                     total,
                 )
-                return
+                return opened
 
             try:
                 log.info(
@@ -2094,11 +2197,12 @@ class Bot:
                     self.handle_auth_error(exc)
                 else:
                     log.warning("开启%s失败：%s", label, exc)
-                return
+                return opened
             except NetworkError as exc:
                 log.warning("开启%s网络错误：%s", label, exc)
-                return
+                return opened
 
+            opened = True
             if not data:
                 data = {}
             log.debug("开箱响应：%s", json.dumps(data, ensure_ascii=False))
@@ -2138,29 +2242,168 @@ class Bot:
                 log.warning("开箱后刷新 /me 失败：%s", exc)
 
             if click_consume > 0 or data.get("asset_name"):
-                card = build_open_card(
+                self._send_card_async(build_open_card(
                     place,
                     data,
                     remaining,
                     image_url=image_url,
                     next_chest=next_chest,
-                )
-                if self.webhook_url:
-                    try:
-                        threading.Thread(
-                            target=send_feishu_card,
-                            args=(self.webhook_url, card, self.webhook_secret),
-                            name="wuwa-feishu",
-                            daemon=True,
-                        ).start()
-                    except Exception as exc:
-                        log.warning("无法启动飞书发送线程：%s", exc)
+                ))
 
             if attempt == 0:
                 time.sleep(OPEN_DELAY_SEC)
 
             if not refreshed:
+                return opened
+        return opened
+
+    def fetch_bag_list(self) -> Optional[list[dict]]:
+        """读取背包；失败时返回 None，由调用方决定是否稍后重试。"""
+        try:
+            data = self.api.request("POST", "api/frontend/bags/list", body={})
+        except ApiError as exc:
+            if exc.code in AUTH_ERROR_CODES:
+                self.handle_auth_error(exc)
+            else:
+                log.warning("读取背包失败：%s", exc)
+            return None
+        except NetworkError as exc:
+            log.warning("读取背包网络错误：%s", exc)
+            return None
+
+        if not isinstance(data, list):
+            log.warning("背包接口返回了非列表数据：%r", data)
+            return None
+        return data
+
+    @staticmethod
+    def synthesis_groups(
+        bags: list[dict],
+    ) -> dict[tuple[str, str], list[tuple[int, int]]]:
+        """按（类型，稀有度）汇总可用于升阶合成的收集物。
+
+        最高稀有度没有更高一级，直接跳过；每个收集物至少保留 1 个，
+        与官方客户端的选择规则一致。
+        """
+        groups: dict[tuple[str, str], list[tuple[int, int]]] = {}
+        max_rarity = BAG_RARITY_ORDER[-1]
+        for item in bags:
+            if not isinstance(item, dict):
+                continue
+
+            asset_type = str(item.get("asset_type") or "").strip().lower()
+            rarity = str(item.get("rarity") or "").strip().lower()
+            asset_id = to_int(item.get("asset_id"))
+            if (
+                not asset_type
+                or rarity not in BAG_RARITY_ORDER
+                or rarity == max_rarity
+                or asset_id <= 0
+            ):
+                continue
+
+            usable = to_int(item.get("quantity")) - 1
+            if usable <= 0:
+                continue
+            groups.setdefault((asset_type, rarity), []).append((asset_id, usable))
+        return groups
+
+    @staticmethod
+    def build_synthesis_ids(items: list[tuple[int, int]]) -> list[int]:
+        """凑齐一次升阶合成所需的 asset_ids，允许重复消耗同一收集物。"""
+        asset_ids: list[int] = []
+        for asset_id, usable in sorted(
+            items,
+            key=lambda pair: pair[1],
+            reverse=True,
+        ):
+            take = min(usable, SYNTHESIS_MATERIAL_COUNT - len(asset_ids))
+            asset_ids.extend([asset_id] * take)
+            if len(asset_ids) >= SYNTHESIS_MATERIAL_COUNT:
+                break
+        if len(asset_ids) != SYNTHESIS_MATERIAL_COUNT:
+            return []
+        return asset_ids
+
+    @staticmethod
+    def synthesis_group_order(group: tuple[str, str]) -> tuple[int, str]:
+        """优先合并低稀有度材料，同级再按类型排序。"""
+        asset_type, rarity = group
+        return BAG_RARITY_ORDER.index(rarity), asset_type
+
+    def maybe_synthesize(self) -> None:
+        """开箱后读取背包并持续升阶合成，直到材料不足下一次合成。
+
+        合成会消耗收集物，因此沿用官方客户端的规则：每个收集物至少
+        保留 1 个，最高稀有度的收集物不参与合成。接口失败的分组跳过，
+        避免在同一个错误上反复请求。
+        """
+        if not self.auto_synthesis:
+            return
+
+        skipped: set[tuple[str, str]] = set()
+        while not self.stop:
+            bags = self.fetch_bag_list()
+            if bags is None:
                 return
+            groups = self.synthesis_groups(bags)
+            candidates = [key for key in groups if key not in skipped]
+            if not candidates:
+                return
+
+            key = min(candidates, key=self.synthesis_group_order)
+            asset_type, rarity = key
+            label = ASSET_TYPE_LABELS.get(asset_type, asset_type)
+            asset_ids = self.build_synthesis_ids(groups[key])
+            if not asset_ids:
+                skipped.add(key)
+                continue
+
+            try:
+                log.info(
+                    "正在升阶合成：材料=%s/%s×%s......",
+                    label,
+                    rarity,
+                    SYNTHESIS_MATERIAL_COUNT,
+                )
+                data = self.api.request(
+                    "POST",
+                    "api/frontend/assets/synthesis",
+                    body={"asset_ids": asset_ids},
+                )
+            except ApiError as exc:
+                if exc.code in AUTH_ERROR_CODES:
+                    self.handle_auth_error(exc)
+                    return
+                log.warning("升阶合成失败（%s/%s）：%s", label, rarity, exc)
+                skipped.add(key)
+                continue
+            except NetworkError as exc:
+                log.warning("升阶合成网络错误（%s/%s）：%s", label, rarity, exc)
+                return
+
+            if not isinstance(data, dict):
+                data = {}
+            log.info(
+                "升阶合成成功：材料=%s/%s×%s 产物=%s 类型=%s 稀有度=%s",
+                label,
+                rarity,
+                SYNTHESIS_MATERIAL_COUNT,
+                data.get("asset_name") or "-",
+                data.get("asset_type") or asset_type,
+                data.get("rarity_type") or "更高稀有度",
+            )
+            log.debug("合成响应：%s", json.dumps(data, ensure_ascii=False))
+            image_url = self.reward_image_url({
+                "asset_type": data.get("asset_type") or asset_type,
+                "asset_name": data.get("asset_name"),
+            })
+            self._send_card_async(build_synthesis_card(
+                asset_type,
+                data,
+                image_url=image_url,
+            ))
+            time.sleep(SYNTHESIS_DELAY_SEC + random.randint(0, 2))
 
     def report_cycle(self) -> str:
         """执行一次点击上报。
@@ -2333,6 +2576,20 @@ class Bot:
 
         self.next_renew = time.time() + RENEW_CHECK_SEC
 
+    def _send_card_async(self, card: dict) -> None:
+        """异步发送飞书卡片，失败只记录日志，不中断主流程。"""
+        if self.dry_run or not self.webhook_url:
+            return
+        try:
+            threading.Thread(
+                target=send_feishu_card,
+                args=(self.webhook_url, card, self.webhook_secret),
+                name="wuwa-feishu",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            log.warning("无法启动飞书发送线程：%s", exc)
+
     def _send_lifecycle_card(self, card: dict) -> bool:
         """同步发送生命周期卡片，确保进程退出前完成。"""
         if self.dry_run or not self.webhook_url:
@@ -2396,11 +2653,13 @@ class Bot:
             preferred_uid=self.cred.get("uid"),
             existing_feishu_webhook=self.webhook_url,
             existing_feishu_secret=self.webhook_secret,
+            existing_auto_synthesis=self.auto_synthesis,
             method=str(self.cred.get("login_method") or "") or None,
             existing_device_id=str(self.cred.get("kuro_device_id") or ""),
         )
         self.webhook_url = str(self.cred.get("feishu_webhook") or "").strip()
         self.webhook_secret = str(self.cred.get("feishu_secret") or "").strip()
+        self.auto_synthesis = bool(self.cred.get("auto_synthesis"))
         if me:
             self.me = me
         else:
@@ -2462,12 +2721,13 @@ class Bot:
         避免开箱耗时把下次上报的间隔压缩到服务端限流窗口内。
         """
         log.info(
-            "开始运行（每次上报 %s-%s 点击，间隔=%s 秒，dry_run=%s，开箱=%s）",
+            "开始运行（每次上报 %s-%s 点击，间隔=%s 秒，dry_run=%s，开箱=%s，升阶合成=%s）",
             REPORT_CLICK_MIN,
             REPORT_CLICK_MAX,
             REPORT_INTERVAL_SEC,
             self.dry_run,
             not self.no_open,
+            self.auto_synthesis,
         )
 
         self.sync_time()
@@ -2492,7 +2752,8 @@ class Bot:
         self.notify_startup()
 
         if self.time_synced:
-            self.maybe_open_chests(self.me)
+            if self.maybe_open_chests(self.me):
+                self.maybe_synthesize()
         else:
             log.warning("跳过启动时的开箱检查：服务器时间尚未同步")
         self.ensure_socket()
@@ -2550,7 +2811,7 @@ class Bot:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="WuwaTappoKeeper：上报 Wuwa Tappo 点击、自动开箱并发送飞书卡片。",
+        description="WuwaTappoKeeper：上报 Wuwa Tappo 点击、自动开箱、自动升阶合成并发送飞书卡片。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
@@ -2576,7 +2837,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="运行 N 个上报周期后退出（0 表示无限）",
     )
-    parser.add_argument("--dry-run", action="store_true", help="不上报、不开箱、不发送卡片")
+    parser.add_argument("--dry-run", action="store_true", help="不上报、不开箱、不合成、不发送卡片")
     parser.add_argument("--no-open", action="store_true", help="正常上报，但不开箱")
     parser.add_argument(
         "--test-webhook",
