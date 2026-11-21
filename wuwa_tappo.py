@@ -1955,6 +1955,9 @@ class Bot:
         self.server_offset_ms = 0
         self.assets_host = ""
         self.chests: list[dict] = []
+        # 已成功开启的宝箱：位置 -> 开箱时使用的就绪时间戳。
+        # /me 在开箱后会短暂返回开箱前的旧时间戳，用它避免重复尝试同一个宝箱。
+        self.opened_chest_at: dict[str, int] = {}
 
         self.next_connect = 0.0
         self.reconnect_delay = 5
@@ -2106,6 +2109,14 @@ class Bot:
             self.pending = 0
 
         self.chests = self.compute_chests(self.me)
+        # 时间戳发生变化说明服务端已写入新的冷却时间，旧的去重标记可以移除。
+        for chest in self.chests:
+            place = chest["place"]
+            if (
+                place in self.opened_chest_at
+                and self.opened_chest_at[place] != chest["readyAt"]
+            ):
+                del self.opened_chest_at[place]
 
     def refresh_me(self) -> None:
         """刷新 /me，开箱成功后检查自动升阶合成。"""
@@ -2138,6 +2149,16 @@ class Bot:
         if self.maybe_open_chests(me):
             self.maybe_synthesize()
 
+    def upcoming_chest_summary(self) -> Optional[tuple[str, str]]:
+        """返回卡片展示的下一次开箱，跳过刚开启、状态仍可能滞后的宝箱。"""
+        visible = []
+        for chest in self.chests:
+            place = str(chest.get("place"))
+            if self.opened_chest_at.get(place) == to_int(chest.get("readyAt")):
+                continue
+            visible.append(chest)
+        return next_chest_summary(visible)
+
     def maybe_open_chests(self, me: dict) -> bool:
         """检查并开启已就绪的宝箱，返回是否有宝箱被成功开启。
 
@@ -2155,6 +2176,10 @@ class Bot:
         opened = False
         for attempt in range(len(CHEST_PLACES)):
             total = to_int(current.get("total_click_count"))
+            # /me 的累计点击会短暂滞后于 socket 上报的 ack 总数，
+            # 用滞后的 click_num 开箱会被服务端判定为 Invalid client click count。
+            if self.reported_total is not None and self.reported_total > total:
+                total = self.reported_total
             consumed = to_int(current.get("total_click_consume"))
             available = max(0, total - consumed)
             if available < CHEST_CLICK_COST:
@@ -2162,10 +2187,17 @@ class Bot:
 
             now = self.server_now_ms()
             place = None
+            ready_at = 0
             for candidate in CHEST_PLACES:
-                ready_at = to_int(current.get(f"{candidate}_treasure_chest"))
-                if 0 < ready_at <= now:
+                candidate_ready_at = to_int(current.get(f"{candidate}_treasure_chest"))
+                # 刚开启过的宝箱，/me 可能仍返回开箱前的就绪时间戳；
+                # 时间戳更新前不再尝试，避免服务端返回 cooldown 或点击数无效。
+                if (
+                    0 < candidate_ready_at <= now
+                    and self.opened_chest_at.get(candidate) != candidate_ready_at
+                ):
                     place = candidate
+                    ready_at = candidate_ready_at
                     break
             if place is None:
                 return opened
@@ -2203,6 +2235,7 @@ class Bot:
                 return opened
 
             opened = True
+            self.opened_chest_at[place] = ready_at
             if not data:
                 data = {}
             log.debug("开箱响应：%s", json.dumps(data, ensure_ascii=False))
@@ -2232,7 +2265,7 @@ class Bot:
                 current = self.api.request("GET", "api/frontend/user/me")
                 self.apply_me(current)
                 refreshed = True
-                next_chest = next_chest_summary(self.chests)
+                next_chest = self.upcoming_chest_summary()
             except ApiError as exc:
                 if exc.code in AUTH_ERROR_CODES:
                     self.handle_auth_error(exc)
